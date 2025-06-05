@@ -20,11 +20,12 @@ from requests.adapters import HTTPAdapter
 from concurrent.futures import ThreadPoolExecutor
 import threading
 from queue import Queue
+import psutil
 
 # Configure logging - ONLY IMPORTANT STUFF
 logging.basicConfig(
-    level=logging.INFO,  # Changed from DEBUG to INFO
-    format="%(levelname)s: %(message)s",  # Simplified format
+    level=logging.INFO,
+    format="%(levelname)s: %(message)s",
     handlers=[
         logging.FileHandler("scraper.log"),
         logging.StreamHandler()
@@ -46,61 +47,137 @@ s3 = boto3.client('s3')
 processed_urls = set()
 processed_urls_lock = threading.Lock()
 
-# Set up WebDriver with optimizations
-def initialize_driver():
+def kill_existing_chrome():
+    """Kill any existing Chrome processes"""
     try:
-        options = Options()
-        options.add_argument("--headless")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--disable-extensions")
-        options.add_argument("--disable-plugins")
-        options.add_argument("--page-load-strategy=eager")
-        options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-        
-        # Block images and media for faster loading
-        prefs = {
-            "profile.managed_default_content_settings.images": 2,
-            "profile.default_content_settings.popups": 0,
-            "profile.managed_default_content_settings.media_stream": 2,
-        }
-        options.add_experimental_option("prefs", prefs)
-        
-        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-        return driver
-    except Exception as e:
-        logging.error(f"WebDriver initialization failed: {e}")
-        return None
+        for proc in psutil.process_iter(['pid', 'name']):
+            if proc.info['name'] and 'chrome' in proc.info['name'].lower():
+                try:
+                    proc.kill()
+                except:
+                    pass
+        time.sleep(2)
+    except:
+        pass
 
-# Thread-safe driver pool
+# Set up WebDriver with robust Chrome handling
+def initialize_driver():
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        try:
+            if attempt > 0:
+                kill_existing_chrome()
+                time.sleep(3)
+            
+            options = Options()
+            options.add_argument("--headless")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--disable-extensions")
+            options.add_argument("--disable-plugins")
+            options.add_argument("--disable-background-timer-throttling")
+            options.add_argument("--disable-backgrounding-occluded-windows")
+            options.add_argument("--disable-renderer-backgrounding")
+            options.add_argument("--disable-features=TranslateUI")
+            options.add_argument("--disable-default-apps")
+            options.add_argument("--no-first-run")
+            options.add_argument("--remote-debugging-port=0")  # Random port
+            options.add_argument("--single-process")
+            options.add_argument("--memory-pressure-off")
+            options.add_argument("--max_old_space_size=4096")
+            options.add_argument(f"--user-data-dir=/tmp/chrome_user_data_{os.getpid()}_{attempt}")
+            options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            
+            # Block images and media for faster loading
+            prefs = {
+                "profile.managed_default_content_settings.images": 2,
+                "profile.default_content_settings.popups": 0,
+                "profile.managed_default_content_settings.media_stream": 2,
+            }
+            options.add_experimental_option("prefs", prefs)
+            
+            service = Service(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=options)
+            driver.set_page_load_timeout(30)
+            
+            # Test the driver
+            driver.get("data:,")
+            return driver
+            
+        except Exception as e:
+            logging.warning(f"WebDriver attempt {attempt + 1} failed: {e}")
+            if attempt == max_attempts - 1:
+                logging.error(f"WebDriver initialization failed after {max_attempts} attempts")
+                return None
+            time.sleep(2)
+    
+    return None
+
+# Conservative driver pool
 class DriverPool:
-    def __init__(self, size=3):
+    def __init__(self, size=2):  # Reduced from 3 to 2
         self.drivers = Queue()
         self.lock = threading.Lock()
-        for _ in range(size):
+        self.active_drivers = []
+        
+        for i in range(size):
             driver = initialize_driver()
             if driver:
                 self.drivers.put(driver)
+                self.active_drivers.append(driver)
+            else:
+                logging.warning(f"Failed to create driver {i+1}")
     
     def get_driver(self):
         with self.lock:
             if not self.drivers.empty():
                 return self.drivers.get()
-        return initialize_driver()
+        
+        # If no drivers available, create a new one
+        new_driver = initialize_driver()
+        if new_driver:
+            self.active_drivers.append(new_driver)
+        return new_driver
     
     def return_driver(self, driver):
         if driver:
-            with self.lock:
-                self.drivers.put(driver)
+            try:
+                # Test if driver is still responsive
+                driver.current_url
+                with self.lock:
+                    self.drivers.put(driver)
+            except:
+                # Driver is dead, don't return it
+                self.cleanup_single_driver(driver)
+    
+    def cleanup_single_driver(self, driver):
+        try:
+            driver.quit()
+        except:
+            pass
+        
+        if driver in self.active_drivers:
+            self.active_drivers.remove(driver)
     
     def cleanup(self):
+        # Clear the queue first
         while not self.drivers.empty():
             try:
-                driver = self.drivers.get()
+                driver = self.drivers.get_nowait()
                 driver.quit()
             except:
                 pass
+        
+        # Clean up any remaining active drivers
+        for driver in self.active_drivers:
+            try:
+                driver.quit()
+            except:
+                pass
+        
+        self.active_drivers.clear()
+        kill_existing_chrome()
 
 # Check AWS credentials
 def check_aws_credentials():
@@ -111,35 +188,22 @@ def check_aws_credentials():
         logging.error("AWS credentials not found")
         return False
 
-# Initialize driver pool
-if not check_aws_credentials():
-    exit(1)
-
-driver_pool = DriverPool(size=3)
-
 base_url = "https://new.kenyalaw.org"
 
 def scrape_page(driver, url, retries=2, backoff_factor=0.5):
     for attempt in range(retries):
         try:
             driver.get(url)
-            WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.TAG_NAME, 'body')))
-            time.sleep(0.2)
+            WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, 'body')))
+            time.sleep(0.5)
             soup = BeautifulSoup(driver.page_source, 'html.parser')
             return soup, driver
         except Exception as e:
             if attempt < retries - 1:
                 time.sleep(backoff_factor ** attempt)
-                if "Connection" in str(e):
-                    driver.quit()
-                    new_driver = initialize_driver()
-                    if new_driver:
-                        driver = new_driver
-                    else:
-                        logging.error("Failed to restart WebDriver")
-                        return None, driver
+                logging.warning(f"Retrying {url} due to: {e}")
             else:
-                logging.error(f"Failed to scrape {url} after {retries} attempts")
+                logging.error(f"Failed to scrape {url} after {retries} attempts: {e}")
                 return None, driver
     return None, driver
 
@@ -223,7 +287,7 @@ def is_document_size_greater_than_zero(text):
 def extract_document_link(driver, url):
     try:
         driver.get(url)
-        WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.TAG_NAME, 'body')))
+        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, 'body')))
         soup = BeautifulSoup(driver.page_source, 'html.parser')
         
         # First try: Look for primary download button
@@ -287,14 +351,14 @@ def download_document_to_s3(url, folder="documents"):
         
         # Download the document
         session = requests.Session()
-        retries = Retry(total=2, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
+        retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
         session.mount('https://', HTTPAdapter(max_retries=retries))
         
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
         
-        response = session.get(url, timeout=15, headers=headers)
+        response = session.get(url, timeout=30, headers=headers)
         
         if response.status_code == 200:
             if len(response.content) == 0:
@@ -315,8 +379,12 @@ def download_document_to_s3(url, folder="documents"):
 
 def process_single_document(link):
     """Process a single document link with its own driver"""
-    driver = driver_pool.get_driver()
+    driver = None
     try:
+        driver = driver_pool.get_driver()
+        if not driver:
+            return None
+            
         document_link = extract_document_link(driver, link)
         if document_link:
             s3_link = download_document_to_s3(document_link)
@@ -324,7 +392,8 @@ def process_single_document(link):
     except Exception as e:
         logging.error(f"Error processing {link}: {e}")
     finally:
-        driver_pool.return_driver(driver)
+        if driver:
+            driver_pool.return_driver(driver)
     return None
 
 def extract_all_cases_links_in_a_query(driver, url):
@@ -347,9 +416,9 @@ def extract_all_cases_links_in_a_query(driver, url):
                 continue
             pdf_download_page_links.extend(pdf_links(page_2))
         
-        # Process PDF links in parallel
+        # Process PDF links in parallel (reduced workers)
         if pdf_download_page_links:
-            with ThreadPoolExecutor(max_workers=4) as executor:
+            with ThreadPoolExecutor(max_workers=2) as executor:
                 results = list(executor.map(process_single_document, pdf_download_page_links))
                 all_documents.extend([r for r in results if r])
                         
@@ -397,7 +466,8 @@ def final_page_scrapper(driver, url):
     except Exception as e:
         logging.error(f"Script failed: {e}")
     finally:
-        driver.quit()
+        if driver:
+            driver.quit()
         driver_pool.cleanup()
         
     logging.info(f"COMPLETED: {document_count} documents collected")
@@ -410,6 +480,16 @@ def final_page_scrapper(driver, url):
     return all_downloadable_links
 
 if __name__ == "__main__":
+    # Check AWS credentials first
+    if not check_aws_credentials():
+        exit(1)
+    
+    # Kill any existing Chrome processes
+    kill_existing_chrome()
+    
+    # Initialize driver pool
+    driver_pool = DriverPool(size=2)
+    
     # Initialize main driver
     driver = initialize_driver()
     if not driver:
@@ -426,5 +506,8 @@ if __name__ == "__main__":
         logging.error(f"Script failed: {e}")
     finally:
         if 'driver' in locals():
-            driver.quit()
+            try:
+                driver.quit()
+            except:
+                pass
         driver_pool.cleanup()
