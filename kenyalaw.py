@@ -17,6 +17,9 @@ from botocore.exceptions import NoCredentialsError, ClientError
 import logging
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
+from concurrent.futures import ThreadPoolExecutor
+import threading
+from queue import Queue
 
 # Configure logging - ONLY IMPORTANT STUFF
 logging.basicConfig(
@@ -39,19 +42,65 @@ logging.getLogger('botocore').setLevel(logging.WARNING)
 bucket_name = "denningdata"
 s3 = boto3.client('s3')
 
-# Set up WebDriver
+# Track processed URLs to avoid duplicates
+processed_urls = set()
+processed_urls_lock = threading.Lock()
+
+# Set up WebDriver with optimizations
 def initialize_driver():
     try:
         options = Options()
         options.add_argument("--headless")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--disable-extensions")
+        options.add_argument("--disable-plugins")
+        options.add_argument("--page-load-strategy=eager")
         options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        
+        # Block images and media for faster loading
+        prefs = {
+            "profile.managed_default_content_settings.images": 2,
+            "profile.default_content_settings.popups": 0,
+            "profile.managed_default_content_settings.media_stream": 2,
+        }
+        options.add_experimental_option("prefs", prefs)
+        
         driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
         return driver
     except Exception as e:
         logging.error(f"WebDriver initialization failed: {e}")
         return None
+
+# Thread-safe driver pool
+class DriverPool:
+    def __init__(self, size=3):
+        self.drivers = Queue()
+        self.lock = threading.Lock()
+        for _ in range(size):
+            driver = initialize_driver()
+            if driver:
+                self.drivers.put(driver)
+    
+    def get_driver(self):
+        with self.lock:
+            if not self.drivers.empty():
+                return self.drivers.get()
+        return initialize_driver()
+    
+    def return_driver(self, driver):
+        if driver:
+            with self.lock:
+                self.drivers.put(driver)
+    
+    def cleanup(self):
+        while not self.drivers.empty():
+            try:
+                driver = self.drivers.get()
+                driver.quit()
+            except:
+                pass
 
 # Check AWS credentials
 def check_aws_credentials():
@@ -62,22 +111,20 @@ def check_aws_credentials():
         logging.error("AWS credentials not found")
         return False
 
-# Initialize driver
+# Initialize driver pool
 if not check_aws_credentials():
     exit(1)
-driver = initialize_driver()
-if not driver:
-    logging.error("Failed to initialize WebDriver")
-    exit(1)
+
+driver_pool = DriverPool(size=3)
 
 base_url = "https://new.kenyalaw.org"
 
-def scrape_page(driver, url, retries=3, backoff_factor=2):
+def scrape_page(driver, url, retries=2, backoff_factor=0.5):
     for attempt in range(retries):
         try:
             driver.get(url)
-            WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, 'body')))
-            time.sleep(1)
+            WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.TAG_NAME, 'body')))
+            time.sleep(0.2)
             soup = BeautifulSoup(driver.page_source, 'html.parser')
             return soup, driver
         except Exception as e:
@@ -176,7 +223,7 @@ def is_document_size_greater_than_zero(text):
 def extract_document_link(driver, url):
     try:
         driver.get(url)
-        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, 'body')))
+        WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.TAG_NAME, 'body')))
         soup = BeautifulSoup(driver.page_source, 'html.parser')
         
         # First try: Look for primary download button
@@ -202,6 +249,12 @@ def extract_document_link(driver, url):
 
 def download_document_to_s3(url, folder="documents"):
     try:
+        # Check if already processed
+        with processed_urls_lock:
+            if url in processed_urls:
+                return None
+            processed_urls.add(url)
+        
         parsed_url = urlparse(url)
         
         # Extract meaningful filename from Kenya Law URLs
@@ -234,14 +287,14 @@ def download_document_to_s3(url, folder="documents"):
         
         # Download the document
         session = requests.Session()
-        retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+        retries = Retry(total=2, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
         session.mount('https://', HTTPAdapter(max_retries=retries))
         
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
         
-        response = session.get(url, timeout=30, headers=headers)
+        response = session.get(url, timeout=15, headers=headers)
         
         if response.status_code == 200:
             if len(response.content) == 0:
@@ -260,6 +313,20 @@ def download_document_to_s3(url, folder="documents"):
         logging.error(f"S3 upload error: {e}")
         return None
 
+def process_single_document(link):
+    """Process a single document link with its own driver"""
+    driver = driver_pool.get_driver()
+    try:
+        document_link = extract_document_link(driver, link)
+        if document_link:
+            s3_link = download_document_to_s3(document_link)
+            return s3_link
+    except Exception as e:
+        logging.error(f"Error processing {link}: {e}")
+    finally:
+        driver_pool.return_driver(driver)
+    return None
+
 def extract_all_cases_links_in_a_query(driver, url):
     all_alphabets_links = extract_alphabetical_links(url)
     all_documents = []
@@ -271,18 +338,20 @@ def extract_all_cases_links_in_a_query(driver, url):
             continue
             
         pages_links = extract_page_numbers_links(alphabet_link, page_1)
+        
+        # Collect all PDF links first
+        pdf_download_page_links = []
         for page_link in pages_links:
             page_2, driver = scrape_page(driver, page_link)
             if not page_2:
                 continue
-                
-            pdf_download_page_links = pdf_links(page_2)
-            for link in pdf_download_page_links:
-                document_link = extract_document_link(driver, link)
-                if document_link:
-                    s3_link = download_document_to_s3(document_link)
-                    if s3_link:
-                        all_documents.append(s3_link)
+            pdf_download_page_links.extend(pdf_links(page_2))
+        
+        # Process PDF links in parallel
+        if pdf_download_page_links:
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                results = list(executor.map(process_single_document, pdf_download_page_links))
+                all_documents.extend([r for r in results if r])
                         
     return all_documents, driver
 
@@ -291,7 +360,7 @@ def final_page_scrapper(driver, url):
     document_count = 0
     
     try:
-        logging.info("Starting scraper...")
+        logging.info("Starting optimized scraper...")
         scraped_page, driver = scrape_page(driver, url)
         if not scraped_page:
             logging.error(f"Failed to scrape base URL: {url}")
@@ -329,6 +398,7 @@ def final_page_scrapper(driver, url):
         logging.error(f"Script failed: {e}")
     finally:
         driver.quit()
+        driver_pool.cleanup()
         
     logging.info(f"COMPLETED: {document_count} documents collected")
     
@@ -340,6 +410,12 @@ def final_page_scrapper(driver, url):
     return all_downloadable_links
 
 if __name__ == "__main__":
+    # Initialize main driver
+    driver = initialize_driver()
+    if not driver:
+        logging.error("Failed to initialize main WebDriver")
+        exit(1)
+    
     try:
         target_url = "https://new.kenyalaw.org/judgments/court-class/superior-courts/"
         result = final_page_scrapper(driver, target_url)
@@ -351,3 +427,4 @@ if __name__ == "__main__":
     finally:
         if 'driver' in locals():
             driver.quit()
+        driver_pool.cleanup()
