@@ -414,7 +414,7 @@ if __name__ == "__main__":
         exit(1)
     
     try:
-        target_url = "https://new.kenyalaw.org/judgments/court-class/tribunals/"
+        target_url = "https://new.kenyalaw.org/legislation/"
         result = final_page_scrapper(target_url)
         logging.info(f"Final result: {len(result)} documents")
         
