@@ -1,0 +1,22 @@
+[project]
+name = "scrapper"
+version = "0.1.0"
+description = "Kenya Law scraper for legal documents"
+requires-python = ">=3.11"
+dependencies = [
+    "selenium",
+    "webdriver-manager",
+    "beautifulsoup4",
+    "requests",
+    "boto3",
+    "botocore",
+    "pinecone-client",
+    "PyPDF2",
+    "langchain",
+    "langchain-community",
+    "langchain-openai",
+    "openai",
+    "langchain-pinecone",
+    "pypdf",
+    "psutil",
+]

@@ -44,7 +44,7 @@ logging.getLogger('boto3').setLevel(logging.WARNING)
 logging.getLogger('botocore').setLevel(logging.WARNING)
 
 # Initialize S3 client
-bucket_name = "denningdata"
+bucket_name = "kenya-law-denning"
 s3 = boto3.client('s3')
 
 # Track processed URLs to avoid duplicates
@@ -95,32 +95,31 @@ def kill_existing_chrome():
 
 def initialize_driver(attempt=0):
     """Initialize a single WebDriver with better error handling"""
+    temp_dir = None
     try:
-        # Create unique temp directory
-        temp_dir = tempfile.mkdtemp(prefix=f'chrome_user_data_{os.getpid()}_{attempt}_')
-        
+        # Create unique temp directory with timestamp for better uniqueness
+        import uuid
+        temp_dir = tempfile.mkdtemp(
+            prefix=f'chrome_user_data_{os.getpid()}_{attempt}_{uuid.uuid4().hex[:8]}_',
+            dir='/tmp'
+        )
+
         options = Options()
-        options.add_argument("--headless")
+        options.add_argument("--headless=new")  # Use new headless mode
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-gpu")
         options.add_argument("--disable-extensions")
-        options.add_argument("--disable-plugins")
         options.add_argument("--disable-background-timer-throttling")
         options.add_argument("--disable-backgrounding-occluded-windows")
         options.add_argument("--disable-renderer-backgrounding")
-        options.add_argument("--disable-features=TranslateUI")
         options.add_argument("--disable-default-apps")
         options.add_argument("--no-first-run")
-        options.add_argument("--disable-web-security")
-        options.add_argument("--disable-features=VizDisplayCompositor")
-        options.add_argument("--single-process")
-        options.add_argument("--memory-pressure-off")
-        options.add_argument("--max_old_space_size=2048")
+        options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_argument(f"--user-data-dir={temp_dir}")
-        options.add_argument("--remote-debugging-port=0")
-        options.add_argument("user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
-        
+        options.add_argument("--window-size=1920,1080")
+        options.add_argument("user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36")
+
         # Block images and media for faster loading
         prefs = {
             "profile.managed_default_content_settings.images": 2,
@@ -128,28 +127,31 @@ def initialize_driver(attempt=0):
             "profile.managed_default_content_settings.media_stream": 2,
         }
         options.add_experimental_option("prefs", prefs)
-        
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option('useAutomationExtension', False)
+
         service = Service(ChromeDriverManager().install())
         driver = webdriver.Chrome(service=service, options=options)
-        driver.set_page_load_timeout(20)
+        driver.set_page_load_timeout(30)
         driver.implicitly_wait(5)
-        
+
         # Test the driver with a simple page
         driver.get("data:text/html,<html><body>Test</body></html>")
-        
+        time.sleep(0.5)
+
         # Store temp directory for cleanup
         driver._temp_dir = temp_dir
-        
+
         return driver
-        
+
     except Exception as e:
-        logging.error(f"Failed to initialize driver: {e}")
+        logging.error(f"Failed to initialize driver (attempt {attempt}): {e}")
         # Clean up temp directory if created
-        if 'temp_dir' in locals():
+        if temp_dir and os.path.exists(temp_dir):
             try:
                 shutil.rmtree(temp_dir)
-            except:
-                pass
+            except Exception as cleanup_error:
+                logging.warning(f"Failed to cleanup temp dir {temp_dir}: {cleanup_error}")
         return None
 
 def cleanup_driver(driver):
@@ -190,7 +192,10 @@ class DriverPool:
         """Create a new driver with retries"""
         for attempt in range(3):
             if attempt > 0:
-                time.sleep(2)
+                logging.info(f"Retrying driver creation (attempt {attempt + 1}/3)...")
+                # Kill any leftover chrome processes before retry
+                kill_existing_chrome()
+                time.sleep(3)
             driver = initialize_driver(attempt)
             if driver:
                 return driver
@@ -402,34 +407,36 @@ def extract_document_link(driver, url):
         logging.error(f"Error extracting document link from {url}: {e}")
         return None
 
-def download_document_to_s3(url, folder="documents"):
+def download_document_to_s3(url, year_name, month_name, folder="documents"):
+    """Download document to S3 with proper year/month folder structure and metadata"""
     try:
         # Check if already processed
         with processed_urls_lock:
             if url in processed_urls:
                 return None
             processed_urls.add(url)
-        
+
         parsed_url = urlparse(url)
-        
-        # Extract meaningful filename from Kenya Law URLs
+
+        # Extract meaningful filename and metadata from Kenya Law URLs
         if '/source' in url and 'kenyalaw.org' in url:
             path_parts = parsed_url.path.split('/')
             if len(path_parts) >= 6:
                 court = path_parts[4]
-                year = path_parts[5]
+                url_year = path_parts[5]
                 case_id = path_parts[6]
-                filename = f"{court}_{year}_{case_id}.pdf"
+                # Create comprehensive filename with court, year, and case ID
+                filename = f"{court}_{url_year}_{case_id}.pdf"
             else:
                 filename = f"document_{int(time.time())}.pdf"
         else:
             filename = os.path.basename(parsed_url.path) or f"document_{int(time.time())}"
             if not filename.lower().endswith(('.pdf', '.doc', '.docx')):
                 filename += ".pdf"
-        
-        now = datetime.now()
-        s3_key = f"{folder}/{now.year}/{now.month:02d}/{filename}"
-        
+
+        # Use comprehensive folder naming: documents/2024/January/ instead of documents/2024/01/
+        s3_key = f"{folder}/{year_name}/{month_name}/{filename}"
+
         # Check if file already exists
         try:
             s3.head_object(Bucket=bucket_name, Key=s3_key)
@@ -439,36 +446,36 @@ def download_document_to_s3(url, folder="documents"):
             if error_code not in ['404', '403']:
                 logging.error(f"S3 error: {e}")
                 return None
-        
+
         # Download the document
         session = requests.Session()
         retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
         session.mount('https://', HTTPAdapter(max_retries=retries))
-        
+
         headers = {
             'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
-        
+
         response = session.get(url, timeout=30, headers=headers)
-        
+
         if response.status_code == 200:
             if len(response.content) == 0:
                 logging.warning(f"Empty file: {url}")
                 return None
-                
+
             # Upload to S3
             s3.put_object(Bucket=bucket_name, Key=s3_key, Body=response.content)
-            logging.info(f"✓ Uploaded: {filename} ({len(response.content)} bytes)")
+            logging.info(f"✓ Uploaded: {year_name}/{month_name}/{filename} ({len(response.content)} bytes)")
             return f"s3://{bucket_name}/{s3_key}"
         else:
             logging.error(f"Download failed ({response.status_code}): {url}")
             return None
-            
+
     except Exception as e:
         logging.error(f"S3 upload error for {url}: {e}")
         return None
 
-def process_single_document(link):
+def process_single_document(link, year_name, month_name):
     """Process a single document link with its own driver"""
     driver = None
     try:
@@ -476,10 +483,10 @@ def process_single_document(link):
         if not driver:
             logging.error(f"No driver available for {link}")
             return None
-            
+
         document_link = extract_document_link(driver, link)
         if document_link:
-            s3_link = download_document_to_s3(document_link)
+            s3_link = download_document_to_s3(document_link, year_name, month_name)
             return s3_link
         return None
     except Exception as e:
@@ -489,21 +496,23 @@ def process_single_document(link):
         if driver:
             driver_pool.return_driver(driver)
 
-def extract_all_cases_links_in_a_query(driver, url):
+def extract_all_cases_links_in_a_query(driver, url, year_name, month_name):
+    """Extract all cases for a given year and month, iterating through alphabets"""
     all_alphabets_links = extract_alphabetical_links(url)
     all_documents = []
-    
+
     for i, alphabet_link in enumerate(all_alphabets_links, 1):
         if cleanup_initiated:
             break
-            
-        logging.info(f"Processing alphabet {i}/26...")
+
+        letter = chr(ord('a') + i - 1)
+        logging.info(f"    [{year_name}/{month_name}] Processing letter '{letter}' ({i}/26)...")
         page_1 = scrape_page(driver, alphabet_link)
         if not page_1:
             continue
-            
+
         pages_links = extract_page_numbers_links(alphabet_link, page_1)
-        
+
         # Collect all PDF links first
         pdf_download_page_links = []
         for page_link in pages_links:
@@ -513,68 +522,88 @@ def extract_all_cases_links_in_a_query(driver, url):
             if not page_2:
                 continue
             pdf_download_page_links.extend(pdf_links(page_2))
-        
-        # Process PDF links sequentially to avoid overwhelming the system
+
+        # Process PDF links sequentially, passing year and month context
         if pdf_download_page_links:
             for link in pdf_download_page_links:
                 if cleanup_initiated:
                     break
-                result = process_single_document(link)
+                result = process_single_document(link, year_name, month_name)
                 if result:
                     all_documents.append(result)
-                        
+
     return all_documents
 
 def final_page_scrapper(driver, url):
+    """Main scraper that filters by year → month → alphabet"""
     all_downloadable_links = set()
     document_count = 0
-    
+
+    # Month number to name mapping
+    month_names = {
+        '1': 'January', '2': 'February', '3': 'March', '4': 'April',
+        '5': 'May', '6': 'June', '7': 'July', '8': 'August',
+        '9': 'September', '10': 'October', '11': 'November', '12': 'December'
+    }
+
     try:
-        logging.info("Starting optimized scraper...")
+        logging.info("Starting scraper with year → month → alphabet filtering...")
         scraped_page = scrape_page(driver, url)
         if not scraped_page:
             logging.error(f"Failed to scrape base URL: {url}")
             return all_downloadable_links
-            
+
         years_links = years_links_extract(url, scraped_page)
-        
+
         for year_idx, year_link in enumerate(years_links, 1):
             if cleanup_initiated:
                 break
-                
-            logging.info(f"Processing year {year_idx}/{len(years_links)}...")
+
+            # Extract year name from URL (e.g., "2024" from ".../2024/")
+            year_name = year_link.rstrip('/').split('/')[-1]
+            logging.info(f"[{year_idx}/{len(years_links)}] Processing Year: {year_name}")
+
             year_page = scrape_page(driver, year_link)
             if not year_page:
                 continue
-                
+
             months_links = months_links_extract(year_link, year_page)
-            
+
             for month_idx, month_link in enumerate(months_links, 1):
                 if cleanup_initiated:
                     break
-                    
-                logging.info(f"  Month {month_idx}/{len(months_links)}")
-                downloadable_links = extract_all_cases_links_in_a_query(driver, month_link)
-                
+
+                # Extract month number from URL and convert to name
+                month_num = month_link.rstrip('/').split('/')[-1]
+                month_name = month_names.get(month_num, month_num)
+                logging.info(f"  [{year_name}] Processing Month: {month_name} ({month_idx}/{len(months_links)})")
+
+                # Pass year and month context down the chain
+                downloadable_links = extract_all_cases_links_in_a_query(driver, month_link, year_name, month_name)
+
                 for link in downloadable_links:
                     if link not in all_downloadable_links:
                         all_downloadable_links.add(link)
                         document_count += 1
-                        
-        # Fallback for direct scraping
+
+        # Fallback for direct scraping (when no year structure exists)
         if not cleanup_initiated and (not years_links or years_links == [url]):
             logging.info("No year structure found, scraping directly...")
-            downloadable_links = extract_all_cases_links_in_a_query(driver, url)
+            # Use current date as fallback for naming
+            now = datetime.now()
+            year_name = str(now.year)
+            month_name = now.strftime('%B')
+            downloadable_links = extract_all_cases_links_in_a_query(driver, url, year_name, month_name)
             for link in downloadable_links:
                 if link not in all_downloadable_links:
                     all_downloadable_links.add(link)
                     document_count += 1
-                    
+
     except Exception as e:
         logging.error(f"Script failed: {e}")
-    
+
     logging.info(f"COMPLETED: {document_count} documents collected")
-    
+
     # Save results
     try:
         with open("s3_links.txt", "w") as f:
@@ -582,7 +611,7 @@ def final_page_scrapper(driver, url):
                 f.write(f"{link}\n")
     except Exception as e:
         logging.error(f"Error saving results: {e}")
-            
+
     return all_downloadable_links
 
 def cleanup_all_resources():
