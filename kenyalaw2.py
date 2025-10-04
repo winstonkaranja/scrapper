@@ -321,6 +321,7 @@ def years_links_extract(url, page):
         return [url]
 
 def months_links_extract(url, page):
+    """Extract month links from page, or generate all 12 months if not found in HTML"""
     try:
         ul_elements = page.find_all("ul", class_="year-nav mb-0 ms-2")
         if len(ul_elements) >= 2:
@@ -330,12 +331,20 @@ def months_links_extract(url, page):
                 if a_tag and "href" in a_tag.attrs:
                     month = a_tag["href"].split("/")[-2]
                     months_links.append(url + month + "/")
-            return months_links
-        else:
-            return [url]
+
+            # If we found months in HTML, return them
+            if months_links:
+                logging.info(f"Found {len(months_links)} months in HTML navigation")
+                return months_links
+
+        # No month navigation found - generate all 12 months programmatically
+        logging.info("No month navigation in HTML - generating months 1-12 programmatically")
+        return [url + f"{month}/" for month in range(1, 13)]
+
     except Exception as e:
         logging.error(f"Error extracting month links: {e}")
-        return [url]
+        # On error, still generate all 12 months to ensure exhaustive scraping
+        return [url + f"{month}/" for month in range(1, 13)]
 
 def extract_page_numbers_links(url, page):
     try:
@@ -575,8 +584,15 @@ def final_page_scrapper(driver, url):
 
                 # Extract month number from URL and convert to name
                 month_num = month_link.rstrip('/').split('/')[-1]
+
+                # Validate that we got a valid month number, not a year
+                if month_num.isdigit() and len(month_num) == 4:
+                    logging.warning(f"Invalid month extraction - got year '{month_num}' instead of month. Skipping.")
+                    continue
+
                 month_name = month_names.get(month_num, month_num)
-                logging.info(f"  [{year_name}] Processing Month: {month_name} ({month_idx}/{len(months_links)})")
+                logging.info(f"  [{year_name}] Processing Month: {month_name} (month {month_num}, {month_idx}/{len(months_links)})")
+                logging.info(f"     URL: {month_link}")
 
                 # Pass year and month context down the chain
                 downloadable_links = extract_all_cases_links_in_a_query(driver, month_link, year_name, month_name)
